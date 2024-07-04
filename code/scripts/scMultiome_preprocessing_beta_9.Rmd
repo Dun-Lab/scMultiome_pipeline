@@ -1,0 +1,1155 @@
+---
+title: "Preprocessing scMultiome data"
+date: "`r format(Sys.time(), '%Y/%m/%d %H:%M:%S')`"
+author: 
+  - name: "Clara Savary"
+    email: "omixanalytics@gmail.com"
+    affiliation: "OmixAnalytics"
+output:
+  html_document:
+    df_print: paged
+    theme: "flatly"
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+params:
+  config: NULL
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  eval       = TRUE,
+  echo       = TRUE,
+	error      = FALSE,
+	fig.align  = "center",
+	message    = TRUE,
+	warning    = FALSE,
+	autodep    = TRUE,
+	cache      = FALSE,
+	cache.lazy = FALSE,
+	results    = "markup"
+)
+
+Sys.getenv("R_MAX_VSIZE")
+```
+
+
+# Description
+
+
+This pipeline is designed to preprocess scMultiome (scRNA-seq and scATAC-seq) data. This includes QC metrics, cell filtration, normalisation, integration and clusters identification.
+
+
+This pipeline is inspired by previous work, including the study of (Dr. Selin Jessa)[https://github.com/sjessa], on (K27M in canonical and noncanonical H3 variants occurs in distinct oligodendroglial cell lineages in brain midline gliomas)[https://www.nature.com/articles/s41588-022-01205-w#Abs1]. Original scripts are available (here)[https://github.com/fungenomics/HGG-oncohistones] and here[https://zenodo.org/record/7221864#.ZFLtVuzP30o].
+
+
+Citation: *Selin Jessa, Steven Hébert, Samantha Worme, Hussein Lakkis, Maud Hulswit, Srinidhi Varadharajan, Nisha Kabir, and Claudia L. Kleinman. (2022). HGG-oncohistones analysis code. Zenodo. https://doi.org/10.5281/zenodo.6647837*
+
+
+Pipeline also inspired by the following workflows: 
+
+
+- (Joint RNA and ATAC analysis: 10x multiomic)[https://stuartlab.org/signac/articles/pbmc_multiomic] | Compiled: April 04, 2024
+
+
+- (Tutorial of single-cell RNA-ATAC multiomic sequencing data analysis in R)[https://github.com/quadbio/scMultiome_analysis_vignette/blob/main/Tutorial.md] | Compiled: April 22, 2024
+
+
+- (Integrating scATAC-seq and scRNA-seq data)[https://nbis-workshop-epigenomics.readthedocs.io/en/latest/content/tutorials/scAtacSeq/lab-sc_atac_seq.html] | Compiled: October, 2024
+
+
+- Integrating single-cell transcriptomes, chromatin accessibility, and multiomics analysis of mesoderm-induced embryonic stem cell[https://star-protocols.cell.com/protocols/2694] | Published: May 19, 2023
+
+
+- (Integrating scRNA-seq and scATAC-seq data)[https://satijalab.org/seurat/articles/seurat5_atacseq_integration_vignette#co-embedding-scrna-seq-and-scatac-seq-datasets] | Compiled: October 31, 2023
+
+
+- (Analyzing PBMC scATAC-seq)[https://stuartlab.org/signac/articles/pbmc_vignette.html]
+
+
+- (Merging objects)[https://stuartlab.org/signac/articles/merging]
+
+
+- (How to integrate more than two scATAC-seq datasets? #455)[https://github.com/stuart-lab/signac/discussions/455] | Answered on Feb 13, 2021
+
+
+- (scATAC-seq data integration)[https://stuartlab.org/signac/articles/integrate_atac]
+
+
+
+# Glossay
+
+
+**ATAC**: Assay for Transposase Accessible Chromatin.
+
+
+**Barcode**: each GEM (Gelbead-in-Emulsion) contains a Gel Bead which carries many DNA oligos with the same barcode. Different GEMs have different barcodes. See also GEM and GEM Well.
+
+
+**GEM**: a Gelbead-in-Emulsion; a droplet containing some sample volume and barcoded Gel Bead, forming an isolated reaction volume. When referring to the subset of the sample contained in the droplet, the term ‘partition’ may also be used. See also GEM Well.
+
+
+**GEM Well (or GEM group)**: a set of partitioned cells (Gelbeads-in-Emulsion) from a single 10x Genomics Chromium chip channel. One or more sequencing libraries can be derived from a single GEM well. See also GEM.
+
+
+**Library (or Sequencing library)**: a 10x-barcoded sequencing library prepared from a single sample, corresponding to a single GEM well of a 10x Genomics Chromium run.
+
+
+**Cell Barcode**: any barcodes that have been determined by the ‘cell-calling’ step of the pipeline to be associated with cells.
+
+
+**Cut-site**: a genome location where transposase cuts the DNA and inserts adapters.
+
+
+**Fragment**: a piece of genomic DNA, bounded by two adjacent cut sites, that has been converted into a sequencer-compatible molecule with an attached cell-barcode. The alignment interval of the fragment is obtained by correcting the alignment interval of the sequenced fragment by +4 bp on the left end of the fragment, and -5bp on the right end (where left and right are relative to genomic coordinates). This is to account for the 9 bp of DNA that the tranposase occupies when it cuts the DNA (accessibility is recorded around the center of this 9 bp stretch; see figure in Algorithms). Most fragment-based metrics computed by the pipeline are based on fragments that passed various quality filters.
+
+
+**Peak**: a compact region of the genome identified as having ‘open chromatin’ due to an enrichment of cut-sites inside the region.
+
+
+More informations available (here)[https://support.10xgenomics.com/single-cell-atac/software/pipelines/latest/glossary].
+
+
+# Set up working session
+
+
+## Load libraries & functions
+```{r libs}
+# Load R libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(here)
+  library(dplyr)
+  library(ggplot2)
+  library(DT)
+  library(cowplot)
+  library(kableExtra)
+  library(glue)
+  library(GenomeInfoDb)
+  library(ggExtra)
+  library(GenomicRanges)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(harmony)
+  library(presto) #devtools::install_github("immunogenomics/presto")
+})
+
+# Load R functions
+source("../functions/scMultiome_v1.R")
+```
+
+
+## Root directory
+```{r dir}
+here::here()
+```
+
+
+## Session theme
+```{r theme}
+ggplot2::theme_set(ggplot2::theme_minimal())
+```
+
+
+## Configuration
+```{r import-config}
+# Load config parameters
+config_tsv <- data.table::fread(params$config, data.table = FALSE)
+
+datatable(config_tsv[, -ncol(config_tsv)])
+```
+
+
+```{r set-config}
+# Coerce to a list of param:value pairs
+config <- as.list(tibble::deframe(config_tsv[, c(1, 2)]))
+config <- lapply(config, type.convert, as.is = TRUE)
+
+# Get specific variables
+samples <- config$samples %>% strsplit(split = ",") %>% unlist
+species <- config$species
+genes <- config$genes %>% strsplit(split = ",") %>% unlist
+sd_QC <- config$sd_QC
+```
+
+
+## Reproducibility
+```{r seed}
+set.seed(config$seed)
+```
+
+
+# Import data
+
+
+Load genome annotations data.
+```{r genome-info}
+# Load genome info
+load(config$genome_info)
+```
+
+
+Load the output from Cell Ranger [10x Genomics], which contains the gene and peak counts.
+
+
+Initialize the Seurat object with the scRNAseq data in the “RNA” assay and the scATACseq data in the “ATAC” assay. This applies one filter: only genes & peaks which are detected in at least config$min_cells are retained. No further filtering on genes or peaks is performed. We also load in the TF analysis (which estimates a total signal for each TF in each cell) from Cellranger, in case we want to use it downstream.
+```{r scMultiome}
+# Import scMultiome data
+seu_obj <- lapply(
+  samples,
+  function(x) import.scMultiome(
+    path       = file.path(config$cellranger_dir, x),
+    sample     = x,
+    annotation = annotation,
+    seqinfo    = seqinfo,
+    min.cells  = config$min_cells
+  )
+)
+# Rename Seurat object list
+names(seu_obj) <- samples
+```
+
+
+# Computing QC metrics
+
+
+In this section, we compute several QC metrics for scRNAseq/scATACseq.
+
+
+For some definitions related to the different metrics computed from Multiome data, see the (10X glossary)[https://support.10xgenomics.com/single-cell-multiome-atac-gex/software/pipelines/latest/glossary]. 
+
+
+In particular, note that for RNA, counts represent the number of UMIs, while for ATAC, counts represent the number of cut/transposition sites.
+
+
+**Count Matrix**: A matrix of counts representing the number of unique observations of each Feature within each Cell Barcode. Each feature (gene or peak) is a row in the matrix, while each barcode is a column. For a gene feature the count represents the number of UMIs observed while for a peak the count represents the number of transposition sites within the peak region.
+
+
+## scRNA metrics
+
+
+### Mitochondrial and ribosomal content
+
+
+For quality control, we assess the mitochondrial content and ribosomal content at the single-cell level, using the proportion of reads which map to mitochondrial genes, or ribosomal protein genes, respectively.
+
+
+The `PercentageFeatureSet` function enables you to easily calculate the percentage of all the counts belonging to a subset of the possible features for each cell. Here, to compute the percentage of transcripts that map to mitochondrial or ribosomal genes. The calculation is simply the column sum of the matrix present in the counts slot for features belonging to the set divided by the column sum for all features times 100.
+
+
+*Mitochondrial ratio [percent_mito]*: This metric will give us a percentage of cell reads originating from the mitochondrial genes.
+
+
+*Ribosomal ratio [percent_ribo]*: This metric will give us a percentage of cell reads originating from the ribosomal genes.
+```{r qc-scRNA}
+seu_obj <- lapply(seu_obj, add_mito_ribo)
+```
+
+
+### Complexity
+
+
+Number of genes detected per UMI [log10GenesPerUMI]: This metric with give us an idea of the complexity of our dataset (*i.e.* the more genes are detected per UMI, the more complex is our dataset).
+```{r qc-complexity}
+seu_obj <- lapply(seu_obj, add_complexity)
+```
+
+
+## scATAC metrics
+
+
+In this section we calculate nucleosome signal and TSS enrichment.
+
+
+Fragment size distribution typically reflects nucleosome binding pattern showing enrichment around values corresponding to fragments bound to a single nucleosome (between 147 bp and 294 bp) as well as nucleosome-free fragments (shorter than 147 bp). The ratio of mono-nucleosome cut fragments to nucleosome-free fragments can be called **nucleosome signal**.
+
+
+Because fragments correspond to cutting at different integer multiples of nucleosomes, the distribution of fragment lengths should reveal a specific nucleosome banding pattern, with a fragment length periodicity of ~200bp. We separate cells based on the nucleosome signal, and it should be clear that one population has the typical periodic nucleosome banding pattern.
+
+
+Chromatin accessibility can be expected to be enriched around **transcription start sites** (TSS) compared to accessibility of flanking regions. Thus this measure averaged across multiple genes can serve as one more quality control metric.
+
+
+Successful scATACseq experiments should have a strong enrichment of accessibility near TSS.
+```{r qc-scATAC}
+seu_obj <- lapply(seu_obj, add_atac_metrics)
+```
+
+
+# Plot QC metrics
+
+
+## scRNA
+
+
+### Mitochondrial counts ratio
+
+
+This metric can identify whether there is a large amount of mitochondrial contamination from dead or dying cells. We define poor quality samples for mitochondrial counts as cells which surpass the 0.2 mitochondrial ratio mark, unless of course you are expecting this in your sample.
+```{r mito-counts, fig.width=8, fig.height=4, fig.align="center"}
+lapply(seu_obj, function(seu) geom_plot(seu, var = "percent_mito", xint = config$max_mito))
+```
+
+
+```{r histo-mito, fig.align="center"}
+lapply(seu_obj, function(x) plot_histo(x, var = "percent_mito", xint = config$max_mito))
+```
+
+
+### Genes detected per cell
+
+
+We have similar expectations for gene detection as for UMI detection, although it may be a bit lower than UMIs. For high quality data, the proportional histogram should contain a single large peak that represents cells that were encapsulated.
+
+
+If we see a small shoulder to the right of the major peak (not present in our data), or a bimodal distribution of the cells, that can indicate a couple of things. It might be that there are a set of cells that failed for some reason. It could also be that there are biologically different types of cells (*i.e.* quiescent cell populations, less complex cells of interest), and/or one type is much smaller than the other (*i.e.* cells with high counts may be cells that are larger in size). Therefore, this threshold should be assessed with other metrics.
+```{r genes-detected, fig.width=8, fig.height=4, fig.align="center"}
+lapply(seu_obj, function(seu) geom_plot(seu, var = "nFeature_RNA", xint = config$min_nFeature_RNA))
+```
+
+
+```{r histo-genes, fig.align="center"}
+lapply(seu_obj, function(x) plot_histo(x, var = "nFeature_RNA", xint = config$min_nFeature_RNA))
+```
+
+
+### UMI counts (transcripts) per cell
+
+
+UMIs are short barcodes that are attached to transcripts before amplification, making it possible to remove polymerase chain reaction duplicates and to obtain more accurate estimates of expression levels. A major shortcoming is that the platforms only allow for the 5′ or 3′ end of each messenger RNA (mRNA) to be sequenced.
+
+
+The UMI counts per cell should generally be above 500, that is the low end of what we expect. If UMI counts are between 500-1000 counts, it is usable but the cells probably should have been sequenced more deeply.
+```{r umi-counts, fig.width=8, fig.height=4, fig.align="center"}
+lapply(seu_obj, function(seu) geom_plot(seu, var = "nCount_RNA", xint = config$min_nCount_RNA))
+```
+
+
+```{r histo-umi, fig.align="center"}
+lapply(seu_obj, function(x) plot_histo(x, var = "nCount_RNA", xint = config$min_nCount_RNA))
+```
+
+
+### Complexity
+
+
+Outlier cells in samples might be cells that have a less complex RNA species than other cells. Sometimes we can detect contamination with low complexity cell types like red blood cells via this metric. Generally, we expect the novelty score to be above 0.80.
+```{r geom-complexity, fig.width=8, fig.height=4, fig.align="center"}
+lapply(seu_obj, function(seu) geom_plot(seu, var = "log10GenesPerUMI", xint = 0.8))
+```
+
+
+### Relation between nGene and nUMI detected
+
+
+Two metrics that are often evaluated together are the number of UMIs and the number of genes detected per cell. Here, we have plotted the number of genes versus the number of UMIs coloured by the fraction of mitochondrial reads. Mitochondrial read fractions are only high (light blue color) in particularly low count cells with few detected genes. This could be indicative of damaged/dying cells whose cytoplasmic mRNA has leaked out through a broken membrane, and thus, only mRNA located in the mitochondria is still conserved. These cells are filtered out by our count and gene number thresholds. Jointly visualizing the count and gene thresholds shows the joint filtering effect.
+
+
+Cells that are poor quality are likely to have low genes and UMIs per cell, and correspond to the data points in the bottom left quadrant of the plot. Good cells will generally exhibit both higher number of genes per cell and higher numbers of UMIs.
+
+
+With this plot we also evaluate the slope of the line, and any scatter of data points in the bottom right hand quadrant of the plot. These cells have a high number of UMIs but only a few number of genes. These could be dying cells, but also could represent a population of a low complexity celltype (*i.e* red blood cells).
+```{r nGene-nUMI}
+lapply(seu_obj, plot_nGene_nUMI)
+```
+
+
+```{r histo-umi-genes, fig.height=5, fig.width=8}
+lapply(seu_obj, plot_rna_complexity)
+```
+
+
+Cells with unexpectedly high counts and a large number of detected genes may represent doublets. Thus, high-count depth thresholds are commonly used to filter out potential doublets.
+
+
+### Violin plots
+
+
+## scATACseq
+
+
+Because fragments correspond to cutting at different integer multiples of nucleosomes, the distribution of fragment lengths should reveal a specific nucleosome banding pattern, with a fragment length periodicity of ~200bp. We separate cells based on the nucleosome signal, and it should be clear that one population has the typical periodic nucleosome banding pattern.
+```{r plot-nucleosome, fig.width = 8, fig.height = 4}
+lapply(seu_obj, plot_nucleosome)
+```
+
+
+The relationship between variables stored in the object metadata can be visualized using the DensityScatter() function. This can also be used to quickly find suitable cutoff values for different QC metrics by setting quantiles=TRUE.
+```{r atac-density}
+lapply(seu_obj, function(seu) DensityScatter(seu, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE))
+```
+
+
+We also quantify chromatin accessibility at transcription start sites (TSS).
+
+
+Successful scATACseq experiments should have a strong enrichment of accessibility near TSS, and we can again use this metric to stratify cells.
+```{r plot-tss-enr, fig.width = 12, fig.height = 4}
+lapply(seu_obj, plot_tss)
+```
+
+
+# Cells filtration
+
+
+## Initialize warnings
+```{r warnings}
+warnings <- list(
+  "LOW_N_CELLS"        = FALSE,
+  "HIGH_MITO"          = FALSE,
+  "HIGH_PROP_FILTERED" = FALSE,
+  "LOW_AVG_UMI"        = FALSE,
+  "CC_ASSIGNMENT"      = FALSE,
+  "SMALL_CLUSTERS"     = FALSE
+)
+```
+
+
+## Generate thresholds
+```{r thresholds}
+# Apply the seu_thresholds function to each sample in the list
+thresholds_list <- lapply(seu_obj, seu_thresholds, sd_QC = config$sd_QC)
+
+# Merge all dataframes into one
+thresholds_all <- do.call(rbind, thresholds_list)
+
+# Plot table
+datatable(thresholds_all, rownames = FALSE)
+```
+
+
+## Plot thresholds: pre-filtration
+```{r plot-pre-qc, fig.width = 13, fig.height = 4}
+lapply(seu_obj, plot_thresholds, title = "Metrics pre-filtration")
+```
+
+
+## Filtering
+```{r filtering-seu}
+seu_obj_filt <- lapply(seu_obj, filter_cells)
+```
+
+
+## Plot thresholds: post-filtration
+```{r plot-post-qc, fig.width = 13, fig.height = 4}
+lapply(seu_obj_filt, plot_thresholds, title = "Metrics post-filtration")
+```
+
+
+## Output summary stats and filtering metrics
+
+
+This report will register warnings if:
+
+- there are few cells after filtering (<1000)
+- more than 40% of cells were filtered out
+- the max mitochondrial content after filtering is > 5% (indicating a higher threshold needed to be used)
+- the average number of UMIs after filtering is < 2000
+
+
+The warnings will be output at the end of the report, and saved as a TSV
+if any warning flags are `TRUE`.
+```{r filtering-metrics}
+lapply(samples, seu_criterion)
+```
+
+
+# Peak calling
+
+
+We next re-call peaks using MACS2, following the Signac documentation, to identify a more accurate set of peaks. Peaks are called for all cells together.
+
+Note that this involves two slow steps: (1) **peak calling** and; (2) **feature counting**.
+
+Peak calling is a computational method used to identify areas in a genome that have been enriched with aligned reads. The goal of the peak calling algorithm in the single-cell ATAC assay is to identify which distinct regions of the genome, known as peaks, are the key features of interest. Each peak is an interval on the genome that has a local enrichment of transposase cut-sites.
+
+ATAC-seq peaks correspond to regions of open chromatin, which have been shown to identify regulatory regions
+
+
+We next re-call peaks using MACS2, following the Signac documentation, to identify a more accurate set of peaks. Peaks are called for all cells together. Note that this involves two slow steps (peak calling, and feature counting):
+```{r call-peaks-macs2}
+seu_obj_filt <- lapply(seu_obj_filt, peak_call)
+```
+
+
+# Normalization and dimensionality reduction
+
+
+## scRNA
+```{r rna-norm, message = FALSE, warning = FALSE}
+seu_obj_filt <- lapply(seu_obj_filt, rna_norm)
+```
+
+
+## scATAC
+
+
+scATACseq processing is done using latent semantic indexing (LSI), and uses a different method for normalization due to increased data sparsity compared to scRNAseq. We perform normalization with the TF-IDF method, which takes into account both sequencing depth and frequency/rarity of peaks. Rather than feature selection based on variability (difficult due to data sparsity), we keep the top n features. Here, we’re keeping all of them. Finally, analogous to PCA, we perform a linear dimensionality reduction with SVD.
+
+
+Often, the first component is highly correlated with technical features, and should not be included in downstream analyses; this is assessed using the correlation plot with depth.
+
+
+If the peaks were identified independently in each experiment then they will likely not overlap perfectly. We can merge peaks from all the datasets to create a common peak set, and quantify this peak set in each experiment prior to merging the objects.
+
+
+First we’ll load the peak coordinates for each experiment and convert them to genomic ranges, the use the GenomicRanges::reduce function to create a common set of peaks to quantify in each dataset.
+```{r atac-ranges}
+# Get genomic coordinates
+peaks_l <- lapply(seu_obj_filt, peak_coord)
+
+# Merge genomic coordinates
+large_gr <- GRanges() 
+for (i in 1:length(peaks_l)) {
+  large_gr <- c(large_gr, peaks_l[[i]])
+}
+
+# The reduce function from GenomicRanges will merge all intersecting peaks
+combined_peaks <- reduce(x = large_gr)
+
+# Filter out bad peaks based on length
+peakwidths <- width(combined_peaks)
+combined_peaks <- combined_peaks[peakwidths < 10000 & peakwidths > 20]
+```
+
+
+```{r atac-norm}
+seu_obj_filt <- lapply(seu_obj_filt, atac_norm)
+```
+
+
+```{r depthcor-peaks}
+lapply(seu_obj_filt, plot_depthcor, assay = "peaks")
+```
+
+
+```{r depthcor-union}
+lapply(seu_obj_filt, plot_depthcor, assay = "peakunion")
+```
+
+
+# Integration of scMultiome data
+
+
+## Merge data
+```{r merge-seu}
+seu_combined <- merge(
+  seu_obj_filt[[1]],
+  unlist(seu_obj_filt[2:length(seu_obj_filt)]),
+  #add.cell.ids = samples,
+  project      = config$project_name
+)
+```
+
+
+## scATACseq normalisation and integration
+
+
+### Normalize merged scATACseq data
+```{r merged-atac}
+# Set up default assay
+DefaultAssay(seu_combined) <- "peakunion"
+
+# Normalisation and dimensionality reduction
+seu_combined <- RunTFIDF(seu_combined) %>%
+  FindTopFeatures(min.cutoff = 50) %>%
+  RunSVD(n = 50)
+
+n_pcs <- Elbow_pcs(seu_combined, ndims = 50, reduction = "lsi")
+message(paste0("npcs selected is: ", n_pcs))
+
+seu_combined <- RunUMAP(
+  seu_combined,
+  reduction      = 'lsi',
+  dims           = 2:n_pcs,
+  reduction.name = "umap_ATAC",
+  reduction.key  = "umap_ATAC_"
+)
+
+# Plot UMAP
+p_atac <- DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, reduction = "umap_ATAC") + ggplot2::ggtitle("Unintegrated scATAC-seq")
+p_atac
+```
+
+
+```{r split-atac}
+DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, split.by = "orig.ident", reduction = "umap_ATAC") + ggplot2::ggtitle("Unintegrated scATAC-seq")
+```
+
+
+### scATAC integration: FindIntegrationAnchors
+```{r atac-anchors}
+# Set default assay
+DefaultAssay(seu_combined) <- "peakunion"
+
+integration_anchors <- FindIntegrationAnchors(
+  object.list     = seu_obj_filt,
+  anchor.features = rownames(seu_combined),
+  reduction       = "rlsi",
+  dims            = 2:config$npcs,
+  k.anchor        = config$atac_anchors,
+)
+
+# Rename cells
+#pattern <- paste0("^", samples, "_") %>% paste0(collapse = "|")
+#new_names <- gsub(pattern, "", Cells(seu_combined))
+#seu_combined <- RenameCells(object = seu_combined, new.names = new_names)
+
+all.cells <- make.unique(
+  names = unname(obj = do.call(what = c, args = lapply(X = seu_obj_filt, FUN = Cells)))
+)
+if (!all(Cells(x = seu_combined[["lsi"]]) %in% all.cells)) {
+      stop("The cell names in the reduction provided don't match the cell names ",
+           "present in the objects used to build the AnchorSet", call. = FALSE)
+}
+
+# Integrate data and create a new merged object
+seu_combined <- IntegrateEmbeddings(
+  anchorset          = integration_anchors,
+  reductions         = seu_combined[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate  = 1:config$npcs
+)
+
+# seu_combined[['integrated_lsi_atac']] <- CreateDimReducObject(
+#   Embeddings(seu_combined, "integrated_lsi")[colnames(seu_combined),], key = "umap_int_lsi_", assay = "ATAC"
+# )
+
+seu_combined <- RunUMAP(
+  seu_combined,
+  reduction      = "integrated_lsi",
+  dims           = 2:config$npcs,
+  reduction.name = "umap_int_lsi",
+  reduction.key  = "umap_int_lsi_"
+)
+
+# Plot UMAP
+p_atac_int <- DimPlot(
+  seu_combined,
+  group.by  = "orig.ident",
+  reduction = "umap_int_lsi"
+) +
+  ggplot2::ggtitle("Integrated scATAC-seq")
+p_atac_int
+```
+
+
+```{r atac-int-norm}
+DefaultAssay(seu_combined) <- "peakunion"
+
+# Normalisation and dimensionality reduction
+seu_combined <- RunTFIDF(seu_combined) %>%
+  FindTopFeatures(min.cutoff = 50) %>%
+  RunSVD(n = 50, reduction.name = "lsi_peakunion")
+
+n_pcs <- Elbow_pcs(seu_combined, ndims = 50, reduction = "lsi_peakunion")
+message(paste0("npcs selected is: ", n_pcs))
+
+seu_combined <- RunUMAP(
+  seu_combined,
+  reduction      = "lsi_peakunion",
+  dims           = 2:n_pcs,
+  reduction.name = "umap_peakunion",
+  reduction.key  = "umap_peakunion_"
+)
+
+DefaultAssay(seu_combined) <- "ATAC"
+
+# Normalisation and dimensionality reduction
+seu_combined <- RunTFIDF(seu_combined) %>%
+  FindTopFeatures(min.cutoff = 50) %>%
+  RunSVD(n = 50, reduction.name = "lsi_ATAC")
+
+n_pcs <- Elbow_pcs(seu_combined, ndims = 50, reduction = "lsi_ATAC")
+message(paste0("npcs selected is: ", n_pcs))
+
+seu_combined <- RunUMAP(
+  seu_combined,
+  reduction      = "lsi_ATAC",
+  dims           = 2:n_pcs,
+  reduction.name = "umap_ATAC",
+  reduction.key  = "umap_ATAC_"
+)
+```
+
+
+```{r viz-atac, fig.height=10, fig.width=18}
+# Set default assay
+DefaultAssay(seu_combined) <- "RNA"
+
+# Plot UMAP and features
+Reduce("|", lapply(c("umap_ATAC", "umap_peakunion", "umap_int_lsi"), umap_viz))
+```
+
+
+```{r umap-atac, fig.height=6, fig.width=14}
+# Set default assay
+p_atac + p_atac_int
+```
+
+
+```{r split-atac-int, fig.height=6, fig.width=14}
+DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, split.by = "orig.ident", reduction = "umap_int_lsi") + ggplot2::ggtitle("Integrated scATAC-seq")
+```
+
+
+## scRNA normalisation and integration
+
+
+### Normalize merged scRNAseq data
+```{r merged-rna}
+# Default assay
+DefaultAssay(seu_combined) <- 'RNA'
+
+# Join RNA layers
+#seu_combined <- JoinLayers(seu_combined, assay = "RNA")
+
+# Normalisation and dimensionality reduction
+seu_combined <- NormalizeData(seu_combined, assay = 'RNA') %>%
+  # Find variable features
+  FindVariableFeatures(
+    selection.method = 'vst',
+    nfeatures = 2000,
+    verbose = TRUE
+  ) %>%
+  # Scale data
+  ScaleData(assay = 'RNA', verbose = TRUE) %>%
+  # Run PCA
+  RunPCA(
+    assay = 'RNA',
+    reduction.name = 'pca_RNA',
+    reduction.key = 'pca_RNA_',
+    verbose = TRUE,
+    npcs = config$npcs
+  )
+
+#n_pcs <- Elbow_pcs(seu_combined, ndims = 50, reduction = "pca_RNA")
+#message(paste0("npcs selected is: ", n_pcs))
+  
+#seu_combined <- RunUMAP(seu_combined, reduction = "pca_RNA", dims = 1:n_pcs, reduction.name = "umap_RNA")
+seu_combined <- RunUMAP(seu_combined, reduction = "pca_RNA", dims = 1:config$npcs, reduction.name = "umap_RNA")
+
+# Plot UMAP
+p_rna <- DimPlot(
+  seu_combined,
+  reduction = "umap_RNA",
+  group.by  = "orig.ident",
+  combine   = FALSE
+)
+
+p_rna <- p_rna[[1]] + ggplot2::ggtitle("Unintegrated scRNA-seq")
+p_rna
+```
+
+
+### scRNA integration: harmony
+```{r rna-harmony, fig.width = 6, fig.height = 5}
+# Set default assay
+DefaultAssay(seu_combined) <- "RNA"
+
+# Perform SCT normalisation and scaling
+seu_combined <- SCTransform(seu_combined, vst.flavor = "v2", assay = "RNA")
+
+# Run PCA
+seu_combined <- RunPCA(
+  seu_combined,
+  npcs           = config$npcs,
+  verbose        = FALSE,
+  assay          = "SCT",
+  reduction.name = 'pca_SCT',
+  reduction.key  = 'pca_SCT_'
+)
+
+# Harmony integration
+seu_combined <- IntegrateLayers(
+  object         = seu_combined,
+  method         = HarmonyIntegration,
+  orig.reduction = "pca_SCT",
+  new.reduction  = 'harmony_RNA',
+  assay          = "SCT",
+  verbose        = FALSE
+)
+
+#n_pcs <- Elbow_pcs(seu_combined, ndims = 50, reduction = "pca_SCT")
+#message(paste0("npcs selected is: ", n_pcs))
+
+#seu_combined <- RunUMAP(seu_combined, reduction = "harmony_RNA", dims = 1:n_pcs, reduction.name = "umap_harmony_RNA")
+seu_combined <- RunUMAP(seu_combined, reduction = "harmony_RNA", dims = 1:config$npcs, reduction.name = "umap_harmony_RNA")
+
+# Plot UMAP
+p_harm <- DimPlot(
+  seu_combined,
+  reduction = "umap_harmony_RNA",
+  group.by  = "orig.ident",
+  combine   = FALSE
+)
+
+p_harm <- p_harm[[1]] + ggplot2::ggtitle("Integrated scRNA-seq")
+p_harm
+```
+
+
+```{r umap-rna, fig.height=6, fig.width=14}
+# Set default assay
+p_rna + p_harm
+```
+
+
+```{r viz-rna, fig.height=10, fig.width=14}
+# Set default assay
+DefaultAssay(seu_combined) <- "RNA"
+
+# Plot UMAP and features
+Reduce("|", lapply(c("umap_RNA", "umap_harmony_RNA"), umap_viz))
+```
+
+
+```{r split-rna-int, fig.height=6, fig.width=14}
+DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, split.by = "orig.ident", reduction = "umap_harmony_RNA") + ggplot2::ggtitle("Integrated scRNA-seq")
+```
+
+
+## Joint dimensionality reduction
+
+
+We use Seurat’s weighted nearest neighbor methods to compute the joint graph from both data types, which will then be used as input to performing non-linear dimensionality reduction using UMAP, followed by clustering.
+
+
+The simultaneous measurement of multiple modalities, known as multimodal analysis necessitates new computational methods that can define cellular states based on multiple data types. The ‘weighted-nearest neighbor’ (WNN) analysis, is an unsupervised framework used to learn the relative utility of each data type in each cell, enabling an integrative analysis of multiple modalities. The (workflow)[https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis.html] consists of three steps:
+
+
+- Independent preprocessing and dimensional reduction of each modality individually
+
+
+- Learning cell-specific modality ‘weights’, and constructing a WNN graph that integrates the modalities
+
+
+- Downstream analysis (*i.e.* visualization, clustering, etc.) of the WNN graph
+
+
+```{r joint-umap, fig.width = 6, fig.height = 5}
+# Build a joint neighbor graph using both assays
+seu_combined <- FindMultiModalNeighbors(
+  object               = seu_combined,
+  reduction.list       = list("harmony_RNA", "integrated_lsi"), 
+  #dims.list = list(1:config$npcs, 2:config$npcs),
+  dims.list            = list(
+    1:ncol(Embeddings(seu_combined, "harmony_RNA")),
+    1:ncol(Embeddings(seu_combined, "integrated_lsi"))
+  ),
+  modality.weight.name = c("RNA.weight", "ATAC.weight"),
+  verbose              = TRUE
+)
+
+# Build a joint UMAP visualization
+seu_combined <- RunUMAP(
+  object         = seu_combined,
+  nn.name        = "weighted.nn",
+  assay          = "RNA",
+  verbose        = FALSE,
+  reduction.name = "umap_WNN",
+  reduction.key  = "wnnUMAP_"
+)
+
+p_wnn <- DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, reduction = "umap_WNN") + ggplot2::ggtitle("Integrated: harmony & integrated_lsi")
+p_wnn
+```
+
+
+```{r viz-joint, fig.height=10, fig.width=18}
+# Set default assay
+DefaultAssay(seu_combined) <- "RNA"
+
+# Plot UMAP and features
+Reduce("|", lapply(c("umap_harmony_RNA", "umap_int_lsi", "umap_WNN"), umap_viz))
+```
+
+
+```{r split-wnn, fig.height=6, fig.width=14}
+DimPlot(seu_combined, group.by = 'orig.ident', pt.size = 0.1, split.by = "orig.ident", reduction = "umap_WNN") + ggplot2::ggtitle("Integrated WNN")
+```
+
+
+# Cluster identities
+
+Cluster based on the weighted nearest neighbour graph computed in the previous step. We’ll do so with several resolutions, and save the chosen revolution specified in the configuration file.
+```{r find-clust, fig.height=8, fig.width=12}
+# To repeat the clustering at various resolutions, we create a function
+# with the parameters that will be held constant, and call it several time
+# with different values for resolution
+clustering_fun <- purrr::partial(
+  FindClusters,
+  object      = seu_combined,
+  algorithm   = 3,
+  graph.name  = "wsnn", # use the joint neighbour-network
+  verbose     = FALSE,
+  n.start     = 10,
+  random.seed = config$seed
+)
+
+seu_combined <- clustering_fun(resolution = 0.1)
+seu_combined <- clustering_fun(resolution = 0.2)
+seu_combined <- clustering_fun(resolution = 0.3)
+seu_combined <- clustering_fun(resolution = 0.4)
+seu_combined <- clustering_fun(resolution = 0.5)
+seu_combined <- clustering_fun(resolution = 0.6)
+
+plot_grid(ncol = 3,
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.1", label = TRUE) + ggtitle("SLM_0.1") + NoLegend(),
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.2", label = TRUE) + ggtitle("SLM_0.2") + NoLegend(),
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.3", label = TRUE) + ggtitle("SLM_0.3") + NoLegend(),
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.4", label = TRUE) + ggtitle("SLM_0.4") + NoLegend(),
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.5", label = TRUE) + ggtitle("SLM_0.5") + NoLegend(),
+  DimPlot(seu_combined, reduction = "umap_WNN", group.by = "wsnn_res.0.6", label = TRUE) + ggtitle("SLM_0.6") + NoLegend()
+)
+```
+
+
+```{r umap-res}
+Idents(seu_combined) <- seu_combined@meta.data$wsnn_res.0.1
+p3 <- DimPlot(seu_combined, reduction = "umap_WNN", label = TRUE) + ggtitle("SLM_0.1") + NoLegend()
+p3
+```
+
+
+```{r umap-res-all, fig.width = 16, fig.height = 5}
+p1 <- DimPlot(seu_combined, reduction = "umap_harmony_RNA", label = TRUE) + ggtitle("SLM_0.1") + NoLegend()
+p2 <- DimPlot(seu_combined, reduction = "umap_int_lsi", label = TRUE) + ggtitle("SLM_0.1") + NoLegend()
+
+cowplot::plot_grid(p1[[1]], p2[[1]], p3[[1]], align = "hv", axis = "tb", ncol = 3)
+```
+
+
+# Create promoter activity matrix
+
+The ATAC data features are peaks, but it can also be useful to have a quantification of chromatin accessibility on a per-gene basis. This is done by counting fragments which overlap the gene promoter, defned as TSS +/- 2.5kbp.
+
+**NOTE**, this is a divergence from the Signac tutorial, which quantifies accessibility, over entire gene promoters & entire gene
+bodies.
+```{r promoter-coords}
+# Load genome info
+load(config$promoter_coords)
+```
+
+
+```{r gene-activity}
+# Set default assay
+DefaultAssay(seu_combined) <- "peaks"
+
+# Quantify gene activity
+gene_activities <- GeneActivity(seu_combined)
+
+# Add the gene activity matrix to the Seurat object as a new assay and normalize it
+seu_combined[["gene_activity"]] <- CreateAssayObject(counts = gene_activities)
+seu_combined <- NormalizeData(
+    object               = seu_combined,
+    assay                = "gene_activity",
+    normalization.method = 'LogNormalize',
+    scale.factor         = median(seu_combined$nCount_RNA)
+)
+
+# Version that works from Selin Jessa
+# # Create a gene by cell matrix (slow step)
+# gene_activities_2 <- FeatureMatrix(
+#   fragments = seu_combined@assays$peaks@fragments,
+#   features  = promoter.coords,
+#   cells     = colnames(seu_combined)
+# )
+# 
+# # Convert rownames from chromsomal coordinates into gene names
+# gene_key <- promoter.coords$gene_name
+# names(gene_key) <- GRangesToString(grange = promoter.coords)
+# rownames(gene_activities_2) <- gene_key[rownames(gene_activities_2)]
+# 
+# # Add the gene activity matrix to the seurat object as a new assay,
+# # and normalize it like RNA data
+# empty_name_rows <- which(rownames(gene_activities_2) == "")
+# empty_name_rows
+# rownames(x = gene_activities_2)[empty_name_rows]
+# gene_activities_2 <- gene_activities_2[-empty_name_rows, ]
+# 
+# seu_combined[['promoters']] <- CreateAssayObject(counts = gene_activities_2)
+# seu_combined <- NormalizeData(
+#   object               = seu_combined,
+#   assay                = 'promoters',
+#   normalization.method = 'LogNormalize',
+#   scale.factor         = median(seu_combined$nCount_promoters)
+# )
+```
+
+
+# Visualization
+
+We can visualize the data both over genomic regions (chromatin accessibility), and for particular genes (gene expression):
+```{r coverage-plots, fig.width = 11, fig.height = 16, message = FALSE}
+DefaultAssay(seu_combined) <- "peaks"
+seu_combined <- JoinLayers(seu_combined, assay = "RNA")
+CoveragePlot(
+    object            = seu_combined,
+    region            = genes,
+    features          = genes,
+    extend.upstream   = 1000,
+    extend.downstream = 1000,
+    ncol              = 1,
+    expression.assay  = "RNA",
+    group.by          = "orig.ident"
+)
+```
+
+
+# DEG
+
+
+## Find cluster markers
+
+
+### FindAllMarkers
+```{r find-markers}
+# Cluster markers
+#DefaultAssay(seu_combined) <- "RNA"
+#cluster_markers <- FindAllMarkers(seu_combined, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+#cluster_markers %>%
+#  group_by(cluster) %>%
+#  top_n(n = 10, wt = avg_log2FC) -> top10
+
+#cluster_markers %>% group_by(cluster) %>% slice_max(n = 10, order_by = avg_log2FC)
+```
+
+
+```{r markers-map, fig.height=6, fig.width=12}
+#DoHeatmap(seu_combined, features = top10$gene) + NoLegend()
+```
+
+
+### Presto
+```{r presto-rna}
+DefaultAssay(seu_combined) <- "RNA"
+RNA_markers <- wilcoxauc(seu_combined, "wsnn_res.0.1", seurat_assay = "RNA")
+top_markers <- RNA_markers %>%
+  filter(abs(logFC) > log(1.2) &
+         padj < 0.01 &
+         auc > 0.65 &
+         pct_in - pct_out > 30 &
+         pct_out < 20) %>%
+  group_by(group) %>%
+  top_n(10, wt = auc)
+
+top_markers
+```
+
+
+```{r presto-atac}
+DefaultAssay(seu_combined) <- "peakunion"
+ATAC_markers <- wilcoxauc(seu_combined, "wsnn_res.0.1", seurat_assay = "peakunion")
+top_peaks <- ATAC_markers %>%
+  filter(abs(logFC) > log(1.1) &
+         padj < 0.01 &
+         auc > 0.55) %>%
+  group_by(group) %>%
+  top_n(100, wt = auc)
+
+top_peaks %>% top_n(5, wt = auc)
+```
+
+
+```{r export-markers}
+out_name <- glue(config$project_name, "_", config$n_features, "_", config$atac_anchors)
+
+#write.table(cluster_markers, file = file.path(config$out_dir, glue(out_name, "_seurat_markers.tsv")), sep = "\t", dec = ".", row.names = TRUE, col.names = TRUE)
+
+write.table(ATAC_markers, file = file.path(config$out_dir, glue(out_name, "_ATAC_markers_", Sys.Date(), ".tsv")), sep = "\t", dec = ".", row.names = FALSE, col.names = TRUE)
+
+write.table(RNA_markers, file = file.path(config$out_dir, glue(out_name, "_RNA_markers_", Sys.Date(), ".tsv")), sep = "\t", dec = ".", row.names = FALSE, col.names = TRUE)
+```
+
+
+# Samples summary
+```{r summary}
+sum_tab_all <- data.frame()
+
+for (i in samples) {
+  
+  meta_sub <- seu_combined@meta.data[seu_combined@meta.data$orig.ident %in% i, ]
+  
+  sum_tab <- data.frame(
+  
+  "n_cell" = nrow(meta_sub),
+  "median_GEX_genes" = median(meta_sub$nFeature_RNA),
+  "median_GEX_UMI" = median(meta_sub$nCount_RNA),
+  "median_ATAC_genes" = median(meta_sub$nFeature_ATAC),
+  "median_ATAC_UMI" = median(meta_sub$nCount_ATAC),
+  "median_peaks_UMI" = median(meta_sub$nCount_peaks),
+  "median_peaks_genes" = median(meta_sub$nFeature_peaks),
+  "median_frag" = median(meta_sub$atac_fragments),
+  "sample" = i
+  
+  )
+  
+  sum_tab_all <- rbind(sum_tab_all, sum_tab)
+  
+}
+
+sum_tab_overall <- data.frame(
+
+"n_cell" = nrow(seu_combined@meta.data),
+"median_GEX_genes" = median(seu_combined@meta.data$nFeature_RNA),
+"median_GEX_UMI" = median(seu_combined@meta.data$nCount_RNA),
+"median_ATAC_genes" = median(seu_combined@meta.data$nFeature_ATAC),
+"median_ATAC_UMI" = median(seu_combined@meta.data$nCount_ATAC),
+"median_peaks_UMI" = median(seu_combined@meta.data$nCount_peaks),
+"median_peaks_genes" = median(seu_combined@meta.data$nFeature_peaks),
+"median_frag" = median(seu_combined@meta.data$atac_fragments),
+"sample" = "overall"
+
+)
+
+sum_tab_all <- rbind(sum_tab_all, sum_tab_overall)
+
+datatable(sum_tab_all)
+```
+
+
+# Export outputs
+
+
+The Seurat object now has the following assays (feature x cell matrices):
+
+
+**RNA**: gene expression data, gene x cell matrix where @counts slot represents number of UMIs.
+
+
+**SCT**: gene expression data, gene x cell matrix produced by Seurat::SCTransform, where the @counts slot represents corrected number of UMIs, the @data slot is the log1p-transformed counts, and the @scale.data slot are pearson residuals.
+
+
+**ATAC**: chromatin accessibility data, peak x cell matrix, with peaks called by Cellranger, and where the count represents the number of cut sites
+peaks chromatin accessibility data, peak x cell matrix, with peaks called by MACS2, and where the count represents the number of cut sites.
+```{r list-assays}
+# List of assays in the Seurat object
+names(seu_combined@assays)
+```
+
+
+```{r export-rds}
+out_name <- glue(config$project_name, "_", config$n_features, "_", config$atac_anchors, "_", Sys.Date())
+
+saveRDS(seu_combined, file = file.path(config$out_dir, glue(out_name, "_scMultiome_combined.rds")))
+
+saveRDS(seu_obj_filt, file = file.path(config$out_dir, glue(out_name, "_scMultiome_objects.rds")))
+```
+
+
+# Session informations
+
+```{r time, echo = FALSE, cache = FALSE}
+message(Sys.time())
+```
+
+
+<details>
+  <summary>**Session Info**</summary>
+```{r info}
+sessionInfo()
+```
+</details>

@@ -1,0 +1,21 @@
+param	value	description
+project_name	PPK_COMBO	string, name of the project
+samples	C57_naive,PPK_untreated,PPK_onc,PPK_pax,PPK_pax_onc	string, names of samples saved in Seurat object
+cellranger_dir	/scratch/rs55/cs4309/PPK_COMBO/data/	string, name of directory of the cellranger run to use
+out_dir	/scratch/rs55/cs4309/PPK_COMBO/output/	string, name of the directory to export Seurat objects
+macs2_path	/home/575/cs4309/tools/miniconda3/envs/env_scMultiome/bin/macs3	string, path of the directory to run MACS2
+species	m_musculus	string, allowed values are "h_sapiens", name of species used to identify mitochrondrial and ribosomal genes
+genome_info	/scratch/rs55/cs4309/PPK_COMBO/scMultiome_pip/data/genome_info/mm10_seqinfo.Rda	string, path to Rda file containing seqinfo and gene annotation
+promoter_coords	/scratch/rs55/cs4309/PPK_COMBO/scMultiome_pip/data/genome_info/mm10_promoter_coordinates.Rda	string, path to Rda file containing promoter coordinates
+n_features	3000	numeric, number of highly variable features selected
+npcs	30	numeric, number of pcs to select for dimensionality reduction
+max_mito	5	numeric, max mitochondrial content
+min_cells	1	numeric, min # of cells in which a peak has to be detected
+min_peak	400	numeric, the min threshold will be the max of this and the mean minus 2SD
+max_nucleosome_signal	1.5	numeric, will override the default upper threshold of the mean plus 2SD
+min_nFeature_RNA	400	numeric, number of PCs to keep for dimensionality reduction for scATAC data
+min_nCount_RNA	0	numeric, number of PCs to keep for dimensionality reduction for scATAC data
+seed	42	numeric, set seed for reproducibility
+atac_anchors	5	numeric, number of anchors used for integration of scATACseq data
+sd_QC	2	numeric, number of standard deviation used for cells filtration
+genes	Olig2,Pdgfra,Ptprc,Gfap	string, gene names to visualise
